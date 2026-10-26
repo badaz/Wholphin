@@ -83,6 +83,17 @@ configure<ApplicationExtension> {
     }
 
     signingConfigs {
+        // Local-only: signs the `releaseTest` build type so an optimized, non-debuggable build
+        // can be installed alongside a store/CI build for testing. Not used by CI or releases.
+        val testKeystore = rootProject.file("wholphin-test.keystore")
+        if (testKeystore.exists()) {
+            create("localTest") {
+                storeFile = testKeystore
+                storePassword = "wholphintest"
+                keyAlias = "wholphintest"
+                keyPassword = "wholphintest"
+            }
+        }
         if (shouldSign.get()) {
             create("ci") {
                 file("ci.keystore").writeBytes(
@@ -129,6 +140,16 @@ configure<ApplicationExtension> {
             isShrinkResources = false
             isDebuggable = true
             applicationIdSuffix = ".debug"
+        }
+
+        // Local-only: a release build (minified, not debuggable) under its own application id so
+        // it can be installed alongside an existing install. Useful for testing a fix under the
+        // same optimization and timing conditions as a real release build.
+        create("releaseTest") {
+            initWith(getByName("release"))
+            applicationIdSuffix = ".test"
+            signingConfig = signingConfigs.findByName("localTest")
+            matchingFallbacks += "release"
         }
     }
     flavorDimensions += "version"
