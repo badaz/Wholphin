@@ -23,6 +23,7 @@ import androidx.media3.exoplayer.DecoderCounters
 import androidx.media3.exoplayer.DecoderReuseEvaluation
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.analytics.AnalyticsListener
+import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.session.MediaSession
 import coil3.imageLoader
 import coil3.request.ImageRequest
@@ -54,6 +55,7 @@ import com.github.damontecres.wholphin.services.RefreshRateService
 import com.github.damontecres.wholphin.services.ScreensaverService
 import com.github.damontecres.wholphin.services.StreamChoiceService
 import com.github.damontecres.wholphin.services.UserPreferencesService
+import com.github.damontecres.wholphin.services.isReleased
 import com.github.damontecres.wholphin.ui.formatBitrate
 import com.github.damontecres.wholphin.ui.gt
 import com.github.damontecres.wholphin.ui.isNotNullOrBlank
@@ -1067,6 +1069,10 @@ class PlaybackViewModel
             }
 
         override fun onPlaybackStateChanged(playbackState: Int) {
+            if (playbackState == Player.STATE_READY) {
+                // Playback is healthy, so allow recovery to be attempted again if it stalls later
+                audioSinkRecoveryAttempts = 0
+            }
             if (playbackState == Player.STATE_ENDED) {
                 Timber.v("Playback state is STATE_ENDED")
                 viewModelScope.launchDefault {
@@ -1600,6 +1606,84 @@ class PlaybackViewModel
             updateCurrentPlayback { it?.copy(audioDecoder = null) }
         }
 
+        private var audioSinkRecoveryJob: Job? = null
+        private var audioSinkRecoveryAttempts = 0
+
+        /**
+         * Recovers from an audio sink that failed to initialize.
+         *
+         * Devices with a single compressed audio output (e.g. Amlogic boxes using the Dolby MS12
+         * HAL) cannot always re-acquire that output straight after a seek, so creating the
+         * [android.media.AudioTrack] fails with `INVALID_OPERATION`. When that happens the audio
+         * renderer is left without a sink, so it never reports itself as ready and playback stalls
+         * in [Player.STATE_BUFFERING] indefinitely with no error reported to the user. Seeking
+         * again triggers a fresh initialization, which is what recovers playback here.
+         */
+        override fun onAudioSinkError(
+            eventTime: AnalyticsListener.EventTime,
+            audioSinkError: Exception,
+        ) {
+            Timber.e(audioSinkError, "onAudioSinkError")
+            if (audioSinkError !is AudioSink.InitializationException) {
+                // Only a sink that failed to initialize leaves the renderer without an output to
+                // write to. Other sink errors don't need recovering from here.
+                return
+            }
+            if (audioSinkRecoveryAttempts >= MAX_AUDIO_SINK_RECOVERY_ATTEMPTS) {
+                Timber.w(
+                    "Giving up on audio sink recovery after %d attempts",
+                    audioSinkRecoveryAttempts,
+                )
+                return
+            }
+            audioSinkRecoveryJob?.cancel()
+            audioSinkRecoveryJob =
+                viewModelScope.launch(WholphinDispatchers.Main) {
+                    delay(AUDIO_SINK_RECOVERY_DELAY)
+                    if (!this@PlaybackViewModel::player.isInitialized) return@launch
+                    val player = this@PlaybackViewModel.player
+                    if (player.isReleased) return@launch
+                    if (player.playbackState != Player.STATE_BUFFERING) {
+                        // The sink recovered on its own
+                        Timber.i("Audio sink recovered on its own, no recovery needed")
+                        audioSinkRecoveryAttempts = 0
+                        return@launch
+                    }
+                    // Buffering with plenty already loaded means the player isn't waiting on the
+                    // network, so it really is the missing audio sink holding playback up. If the
+                    // buffer is short then this is more likely to just be a slow connection, and
+                    // seeking would make that worse rather than better.
+                    val bufferedAhead = player.bufferedPosition - player.currentPosition
+                    if (bufferedAhead < AUDIO_SINK_STALL_MIN_BUFFER.inWholeMilliseconds) {
+                        Timber.i(
+                            "Still buffering after an audio sink error but only %dms is buffered, assuming a slow connection rather than a stalled audio sink",
+                            bufferedAhead,
+                        )
+                        return@launch
+                    }
+                    audioSinkRecoveryAttempts++
+                    // Seeking to the position the player is already at is explicitly a no-op in
+                    // ExoPlayer, which would leave the renderers untouched, so offset the seek.
+                    // Prefer seeking backwards to avoid skipping over any content, but that isn't
+                    // possible when stalled at the very start of the media, which is exactly what
+                    // happens when the sink fails to initialize on the first play.
+                    val offset = AUDIO_SINK_RECOVERY_SEEK_OFFSET.inWholeMilliseconds
+                    val currentPosition = player.currentPosition
+                    val position =
+                        if (currentPosition >= offset) {
+                            currentPosition - offset
+                        } else {
+                            currentPosition + offset
+                        }
+                    Timber.w(
+                        "Audio sink is stalled, seeking to %d to re-initialize it (attempt %d)",
+                        position,
+                        audioSinkRecoveryAttempts,
+                    )
+                    player.seekTo(position)
+                }
+        }
+
         private var subtitleDelaySaveJob: Job? = null
 
         fun updateSubtitleDelay(delta: Duration) {
@@ -1718,3 +1802,26 @@ class PlaybackViewModel
             }
         }
     }
+
+private const val MAX_AUDIO_SINK_RECOVERY_ATTEMPTS = 3
+
+/**
+ * How long to wait before checking whether an audio sink error left playback stalled.
+ *
+ * The sink often recovers on its own within about a second, so only step in after that.
+ */
+private val AUDIO_SINK_RECOVERY_DELAY = 2.seconds
+
+/**
+ * How far from the current position to seek when recovering a stalled audio sink.
+ *
+ * Only needs to be far enough that ExoPlayer doesn't treat it as a seek to the current position,
+ * which it ignores.
+ */
+private val AUDIO_SINK_RECOVERY_SEEK_OFFSET = 1.seconds
+
+/**
+ * How much buffered content must be loaded ahead of the playback position before a stall is
+ * treated as a stalled audio sink rather than a slow connection.
+ */
+private val AUDIO_SINK_STALL_MIN_BUFFER = 3.seconds
