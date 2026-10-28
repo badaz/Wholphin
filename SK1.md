@@ -53,6 +53,32 @@ Things that do not work, and why:
 - Disabling audio offload (`AudioOffloadPreferences`, or Wholphin's "disable hardware audio offload" setting) has no effect: E-AC3 passthrough never goes through media3's offload path.
 - `seekTo(currentPosition)` is a no-op in ExoPlayer, so the recovery seek has to be offset. Near position 0 it must seek forwards, since clamping to 0 is the same no-op.
 
+## Reproducing and monitoring
+
+Not yet checked on the box as written: the log lines come from the original investigation notes. Correct this section once confirmed.
+
+Start the monitor before reproducing. It catches both the system-side failure, which shows with any Wholphin build, and the workaround's own messages, which only the `releaseTest` build logs:
+
+```
+adb -s 192.168.2.82:5555 logcat -v time | grep -E 'createTrack_l|could not create track|onAudioSinkError|Audio sink is stalled|Giving up on audio sink recovery'
+```
+
+How to read it:
+
+- `AudioTrack: createTrack_l(...): AudioFlinger could not create track, status: -38` means the bug happened. Other statuses are a different problem (`-12`, for example, is the system running out of memory for the track).
+- With the `releaseTest` build, `onAudioSinkError` should follow, then `Audio sink is stalled, seeking to …` about 2 s later, then playback resumes. `Audio sink recovered on its own` means media3 recovered without help, which is common after a seek.
+- `Giving up on audio sink recovery after 3 attempts` means the workaround failed: the screen stays black.
+- With the store app, a `-38` line followed by a black screen that never starts is the unpatched bug.
+
+To reproduce, at human speed (see below):
+
+1. Make sure the box passes E-AC3 through: an E-AC3 audio track on the film, the receiver or TV reporting Dolby Digital Plus, and Wholphin not transcoding the audio.
+2. At playback start: start a film with the store Wholphin app (unpatched). The freeze happens on a fair share of ordinary starts; if it does not, stop and start again a few times, pausing between attempts.
+3. After a seek: right after the film starts, while the buffer is still short, seek a few times about 1 s apart. Seeks about 1.2 s apart reproduced it; 1.6 s apart did not.
+4. Repeat the same steps with "Wholphin (Test)" to check that the workaround turns the freeze into a spinner of about 2 s.
+
+Seen from the TV, the bug is a black screen (or a frozen frame after a seek) with the loading spinner and no error message.
+
 ## Debugging on the box
 
 The box is at `192.168.2.82:5555` over adb.
@@ -64,7 +90,7 @@ The box is at `192.168.2.82:5555` over adb.
   adb -s 192.168.2.82:5555 logcat -s Wholphin | grep -iE 'audio sink|onAudioSinkError'
   ```
 
-  When the workaround kicks in, `onAudioSinkError` is followed by `Audio sink is stalled, seeking to …`. The `status: -38` line comes from the system `AudioTrack` tag, so look for it in the unfiltered logcat.
+  When the workaround kicks in, `onAudioSinkError` is followed by `Audio sink is stalled, seeking to …`. The `status: -38` line comes from the system `AudioTrack` tag, so this filter misses it: use the monitor in [Reproducing and monitoring](#reproducing-and-monitoring).
 - Read the firmware version with `adb shell getprop ro.build.version.incremental`.
 
 Test at human speed. An automated loop of playback restarts and rapid seeks kernel-panicked the box (`sys.boot.reason=kernel_panic`), with no usable trace, and lost an installed app. The Amlogic audio driver is fragile exactly along the path being tested. Ordinary film starts reproduce the bug readily, so daily use is a better test than synthetic stress. When seeking repeatedly, seek backwards in bursts and forwards one step at a time, so whoever is watching does not lose their place.
