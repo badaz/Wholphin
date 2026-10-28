@@ -4,6 +4,19 @@ This branch is upstream Wholphin plus a workaround for playback freezing on a bl
 
 This file is the single reference for this work: everything needed to pick it up on another machine is here.
 
+## Status (2026-10-28)
+
+The bug no longer shows with Wholphin 1.0.9 or later, even without this workaround: media3 1.11.1, which Wholphin 1.0.9 ships, recovers on its own. The firmware did not fix it. Tested on firmware 2.2.0 (build `eng.ugoos.20260903.125945`) with episodes of season 1 of *Carrie* (E-AC3):
+
+| Build                                          | media3 | `-38` errors     | Recovered on its own                                |
+| ---------------------------------------------- | ------ | ---------------- | --------------------------------------------------- |
+| Store Wholphin 1.0.9, no workaround            | 1.11.1 | 12 over 8 starts | all, within 70 to 340 ms                            |
+| Upstream v1.0.3 + `releaseTest`, no workaround | 1.10.1 | 2 over 2 starts  | first only; the second froze for good, as on 2.0.7  |
+
+On 2.2.0, `AudioFlinger` still refuses the output as often as on 2.0.7, for TrueHD as well as E-AC3. With media3 1.10.1, after the refusal the HAL output is closed and media3 never asks for it again. A likely cause, not checked in media3's code, is the 1.11.1 fix "release count doesn't decrease when playback thread is no longer alive": media3 waits for pending releases to reach zero before retrying.
+
+The workaround stays as a safety net in case a later media3 breaks this retry again. It costs nothing when media3 recovers, since it only acts after 2 s stuck in buffering.
+
 ## Setting up a machine
 
 ```
@@ -33,7 +46,7 @@ AudioTrack: createTrack_l(...): AudioFlinger could not create track, status: -38
 
 There are two variants:
 
-- At playback start (position around 0), media3 never recovers on its own: the freeze is permanent. This is the common, user-visible case.
+- At playback start (position around 0), media3 1.10 never recovers on its own: the freeze is permanent. This is the common, user-visible case. Media3 1.11.1 recovers (see [Status](#status-2026-10-28)).
 - After a mid-playback seek, media3's internal retry usually succeeds within about 70 ms, so it is often invisible. It was reproduced with seeks about 1.2 s apart on a shallow buffer.
 
 The tell that this is the bug and not the network: the player is stuck buffering with plenty already buffered ahead (17 s and 7.5 s were observed).
@@ -55,27 +68,33 @@ Things that do not work, and why:
 
 ## Reproducing and monitoring
 
-Not yet checked on the box as written: the log lines come from the original investigation notes. Correct this section once confirmed.
+Checked on the box on 2026-10-28.
 
-Start the monitor before reproducing. It catches both the system-side failure, which shows with any Wholphin build, and the workaround's own messages, which only the `releaseTest` build logs:
+A continuous `adb logcat` over Wi-Fi drops after a few minutes (the box logs a lot, and the connection blips). Instead, reproduce, then dump the box's log buffer right away; it holds about 20 minutes:
 
 ```
-adb -s 192.168.2.82:5555 logcat -v time | grep -E 'createTrack_l|could not create track|onAudioSinkError|Audio sink is stalled|Giving up on audio sink recovery'
+adb -s 192.168.2.82:5555 logcat -d -v time > box.log
+grep -E 'Playing [0-9a-f-]{36}|status: -38|adev_open_output_stream:3098|adev_close_output_stream_new|out_set_volume:1136|onAudioSinkError|Audio sink is stalled|Giving up on audio sink recovery' box.log
 ```
 
 How to read it:
 
-- `AudioTrack: createTrack_l(...): AudioFlinger could not create track, status: -38` means the bug happened. Other statuses are a different problem (`-12`, for example, is the system running out of memory for the track).
+- `I/Wholphin: Playing <item id>` marks each playback start.
+- `audio_hw_hal_primary: [adev_open_output_stream:3098] ... format:E_AC3(0xa000000) flags:0x11` is the HAL opening the passthrough output; the format says what is actually sent (`E_AC3`, `AC3`, `DOLBY_TRUEHD`).
+- `AudioTrack: createTrack_l(...): AudioFlinger could not create track, status: -38`, preceded by `APM_AudioPolicyManager: getOutputForDevices() could not find output ... flags 0x1`, means the output was refused. Other statuses are a different problem (`-12`, for example, is the system running out of memory for the track).
+- Recovered: within a few hundred milliseconds, another `adev_open_output_stream` for the same format, then `out_set_volume:1136 ... internal_format:E_AC3`, which shows the new track playing.
+- Frozen: after the `-38`, an `adev_close_output_stream_new` and then nothing for that format. `adb shell dumpsys media_session` then shows `state=BUFFERING(6), position=0, ... error=null`. That state is only reliable while frozen: during normal playback it can be stale.
 - With the `releaseTest` build, `onAudioSinkError` should follow, then `Audio sink is stalled, seeking to …` about 2 s later, then playback resumes. `Audio sink recovered on its own` means media3 recovered without help, which is common after a seek.
 - `Giving up on audio sink recovery after 3 attempts` means the workaround failed: the screen stays black.
 - With the store app, a `-38` line followed by a black screen that never starts is the unpatched bug.
 
 To reproduce, at human speed (see below):
 
-1. Make sure the box passes E-AC3 through: an E-AC3 audio track on the film, the receiver or TV reporting Dolby Digital Plus, and Wholphin not transcoding the audio.
-2. At playback start: start a film with the store Wholphin app (unpatched). The freeze happens on a fair share of ordinary starts; if it does not, stop and start again a few times, pausing between attempts.
-3. After a seek: right after the film starts, while the buffer is still short, seek a few times about 1 s apart. Seeks about 1.2 s apart reproduced it; 1.6 s apart did not.
-4. Repeat the same steps with "Wholphin (Test)" to check that the workaround turns the freeze into a spinner of about 2 s.
+1. Use a build with media3 1.10, since 1.11.1 recovers on its own: upstream v1.0.3 without the workaround. Build it in a separate worktree, `git worktree add --detach ../wh-103 v1.0.3`, cherry-pick the commit that adds the `releaseTest` build type, copy `wholphin-test.keystore`, then build and install as in [Building the test app](#building-the-test-app). It installs as "Wholphin (Test)" and needs signing in to the Jellyfin server.
+2. Use an E-AC3 title: any episode of season 1 of *Carrie* works. Check in the log that the output opens as `format:E_AC3`.
+3. At playback start: start the episode, wait for the picture (or 15 s), stop, and start again, a few seconds apart. With media3 1.10 it froze on the second start.
+4. After a seek: right after the film starts, while the buffer is still short, seek a few times about 1 s apart. Seeks about 1.2 s apart reproduced it on firmware 2.0.7; 1.6 s apart did not.
+5. To check the workaround itself, rebase it onto v1.0.3 the same way and repeat: the freeze should turn into a spinner of about 2 s.
 
 Seen from the TV, the bug is a black screen (or a frozen frame after a seek) with the loading spinner and no error message.
 
@@ -90,7 +109,7 @@ The box is at `192.168.2.82:5555` over adb.
   adb -s 192.168.2.82:5555 logcat -s Wholphin | grep -iE 'audio sink|onAudioSinkError'
   ```
 
-  When the workaround kicks in, `onAudioSinkError` is followed by `Audio sink is stalled, seeking to …`. The `status: -38` line comes from the system `AudioTrack` tag, so this filter misses it: use the monitor in [Reproducing and monitoring](#reproducing-and-monitoring).
+  When the workaround kicks in, `onAudioSinkError` is followed by `Audio sink is stalled, seeking to …`. The `status: -38` line comes from the system `AudioTrack` tag, so this filter misses it: use the log dump in [Reproducing and monitoring](#reproducing-and-monitoring).
 - Read the firmware version with `adb shell getprop ro.build.version.incremental`.
 
 Test at human speed. An automated loop of playback restarts and rapid seeks kernel-panicked the box (`sys.boot.reason=kernel_panic`), with no usable trace, and lost an installed app. The Amlogic audio driver is fragile exactly along the path being tested. Ordinary film starts reproduce the bug readily, so daily use is a better test than synthetic stress. When seeking repeatedly, seek backwards in bursts and forwards one step at a time, so whoever is watching does not lose their place.
@@ -116,4 +135,8 @@ Keep the store app installed: it is the unpatched comparison.
 
 ## When the workaround can go
 
-The defect is in the vendor audio driver. The box runs firmware 2.0.7. Ugoos's changelogs announce "Fixed some audio passthrough issues" in 2.0.8 and "Audio passthrough fixes" in 2.2.0, with no detail and no user reports either way. To check, flash the latest firmware ([guide](https://ugoos.com/amlogic-firmware-reflashing-guide); 2.0.7 changed how to enter recovery), then start E-AC3 films with the unpatched store app. If several starts go through without `status: -38` or a black screen, the firmware fixed it and this branch is no longer needed.
+With Wholphin 1.0.9 (media3 1.11.1), the workaround is no longer needed (see [Status](#status-2026-10-28)). Keep it while it rebases cleanly, and drop it if it starts conflicting.
+
+The output refusal itself is in the vendor audio driver and survives firmware 2.2.0, despite "Fixed some audio passthrough issues" in 2.0.8 and "Audio passthrough fixes" in 2.2.0. To check a later firmware ([reflashing guide](https://ugoos.com/amlogic-firmware-reflashing-guide); 2.0.7 changed how to enter recovery), start E-AC3 titles and count the `-38` lines: if there are none over several starts and seeks, the driver is fixed.
+
+After a media3 upgrade in Wholphin, check again with the store app: several starts of an E-AC3 title, then the log. Any `-38` not followed by a reopened output means media3 stopped recovering, and the workaround is needed again.
